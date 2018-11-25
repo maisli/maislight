@@ -100,6 +100,7 @@ class RGBToHSLVector(gp.BatchFilter):
         rgb = batch[self.raw].data
 
         # c, z, y, x
+        # convert rgb to hsl, assume that rgb is float [0,1]
         maxc = np.max(rgb, axis=0)
         minc = np.min(rgb, axis=0)
         dst = np.zeros_like(rgb, dtype=np.float32)
@@ -129,6 +130,10 @@ class RGBToHSLVector(gp.BatchFilter):
         dst[0, idx] = (4.0+gc-rc)[idx]
         
         dst[0] = (dst[0]/6.0) % 1.0
+
+        # convert hsl to vector
+        dst[1] = dst[1] * np.sin(np.radians(dst[0]))
+        dst[0] = np.cos(np.radians(dst[0]))
 
         batch[self.hsl] = gp.Array(data=dst.astype(np.float32), spec=spec)
 
