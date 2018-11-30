@@ -1,19 +1,20 @@
 from __future__ import print_function
 import gunpowder as gp
 from gunpowder.roi import Roi
-from maislight.gunpowder import Hdf5ChannelSource, SwcSource
+from maislight.gunpowder import Hdf5ChannelSource, SwcSource, RasterizeSwcSkeleton
 import numpy as np
 import json
 import logging
 import tensorflow as tf
 import sys
 import math
+import os
 
 raw_files = [
     #'/nrs/mouselight/SAMPLES/',
-    #'../01_data',
-    'experiments/01_data/2017-09-25/2017-09-25_G-003_carved.h5',
-    'experiments/01_data/2017-09-25/2017-09-25_G-006_carved.h5',
+    #'../../01_data',experiments
+    '../../01_data/2017-09-25/2017-09-25_G-003_carved.h5',
+    '../../01_data/2017-09-25/2017-09-25_G-006_carved.h5',
     ]
 gt_files = [
     'experiments/01_data/2017-09-25/2017-09-25_G-003_carved_segmented.h5',
@@ -70,13 +71,13 @@ class MergeChannel(gp.BatchFilter):
 
     def process(self, batch, request):
         spec = self.spec[self.fg].copy()
-        merged = np.stack([batch[self.fg].data, batch[self.bg].data],
-                          axis=0)
+        voxel_size = (1,) + spec.voxel_size
+        merged = np.stack([batch[self.fg].data, batch[self.bg].data], axis=0)
         batch[self.raw] = gp.Array(data=merged.astype(spec.dtype),
                                    spec=gp.ArraySpec(dtype=spec.dtype,
-                                                     roi=Roi((0, 0, 0, 0), merged.shape),
+                                                     roi=Roi((0, 0, 0, 0), merged.shape) * voxel_size,
                                                      interpolatable=True,
-                                                     voxel_size=gp.Coordinate((1, 1, 1, 1))))
+                                                     voxel_size=voxel_size))
 
 
 def train_until(max_iteration):
@@ -99,25 +100,27 @@ def train_until(max_iteration):
     bg = gp.ArrayKey('BG')
     gt = gp.ArrayKey('GT')
     swc = gp.PointsKey('SWC')
+    skeleton = gp.ArrayKey('SKELETON')
     gt_binary = gp.ArrayKey('GT_BINARY')
     loss_weights = gp.ArrayKey('LOSS_WEIGHTS')
     prediction = gp.ArrayKey('PREDICTION')
     loss_gradient = gp.ArrayKey('LOSS_GRADIENT')
     
-    voxel_size = gp.Coordinate((1, 1, 1))
-    input_size = gp.Coordinate(net_config['input_shape'])
-    output_size = gp.Coordinate(net_config['output_shape'])
+    voxel_size = gp.Coordinate((3, 3, 10))
+    input_size = gp.Coordinate(net_config['input_shape']) * voxel_size
+    output_size = gp.Coordinate(net_config['output_shape']) * voxel_size
 
     request = gp.BatchRequest()
     request.add(fg, input_size)
     request.add(bg, input_size)
     request.add(swc, output_size)
-    request.add(gt, output_size)
+    #request.add(gt, output_size)
+    request.add(skeleton, output_size)
     request.add(loss_weights, output_size)
     
     snapshot_request = gp.BatchRequest({
-        prediction: request[gt],
-        loss_gradient: request[gt],
+        prediction: request[skeleton],
+        loss_gradient: request[skeleton],
         })
 
     data_sources = tuple()
@@ -139,15 +142,15 @@ def train_until(max_iteration):
                 bg: gp.ArraySpec(interpolatable=True, voxel_size=voxel_size),
                 }
         ),
-        gp.Hdf5Source(
-            gt_file,
-            datasets={
-                gt: '/segmentation/AC',
-            },
-            array_specs={
-                gt: gp.ArraySpec(interpolatable=False, voxel_size=voxel_size),
-            }
-        ),
+        #gp.Hdf5Source(
+        #    gt_file,
+        #    datasets={
+        #        gt: '/segmentation/AC',
+        #    },
+        #    array_specs={
+        #        gt: gp.ArraySpec(interpolatable=False, voxel_size=voxel_size),
+        #    }
+        #),
         SwcSource(
             raw_file,
             '/reconstruction',
@@ -155,8 +158,9 @@ def train_until(max_iteration):
         )) +
         gp.MergeProvider() +
         gp.RandomLocation(ensure_nonempty=swc) +
-        gp.Reject(gt, 0.001)
-        for raw_file, gt_file in zip(raw_files, gt_files)
+        RasterizeSwcSkeleton(swc, skeleton, gp.ArraySpec(interpolatable=False, voxel_size=voxel_size), distance=(90, 90, 300)) +
+        gp.Reject(skeleton, 0.001)
+        for raw_file in raw_files
     )
 
     pipeline = (
@@ -169,26 +173,26 @@ def train_until(max_iteration):
                 jitter_sigma=[1, 1, 1],
                 rotation_interval=[0, math.pi / 2.0],
                 subsample=8) +
-            gp.SimpleAugment() +
+            #gp.SimpleAugment() +
 
             MergeChannel(fg, bg, raw) +
             gp.Normalize(raw) +
             gp.IntensityAugment(raw, 0.9, 1.1, -0.001, 0.001) +
 
-            BinarizeGt(gt, gt_binary) +
-            gp.BalanceLabels(gt_binary, loss_weights) +
+            #BinarizeGt(gt, gt_binary) +
+            gp.BalanceLabels(skeleton, loss_weights) +
 
             # train
-            gp.PreCache(
-                cache_size=40,
-                num_workers=10) +
+            #gp.PreCache(
+            #    cache_size=40,
+            #    num_workers=10) +
             gp.tensorflow.Train(
                 './train_net',
                 optimizer=net_names['optimizer'],
                 loss=net_names['loss'],
                 inputs={
                     net_names['raw']: raw,
-                    net_names['gt']: gt_binary,
+                    net_names['gt']: skeleton,
                     net_names['loss_weights']: loss_weights,
                 },
                 outputs={
@@ -201,10 +205,11 @@ def train_until(max_iteration):
 
             # visualize
             gp.Snapshot({
-                    raw: 'volumes/raw',
+                    fg: 'volumes/raw',
                     prediction: 'volumes/prediction',
-                    gt: 'volumes/gt',
-                    gt_binary: 'volumes/gt_binary',
+                    #gt: 'volumes/gt',
+                    #gt_binary: 'volumes/gt_binary',
+                    skeleton: '/volumes/skeleton',
                     loss_weights: 'volumes/loss_weights',
                     loss_gradient: 'volumes/gradient',
                 },
@@ -223,7 +228,12 @@ def train_until(max_iteration):
 if __name__ == "__main__":
 
     logging.basicConfig(level=logging.INFO)
-
-    iteration = int(sys.argv[1])
+    if len(sys.argv) <= 1:
+        iteration = 20
+        os.environ["CUDA_DEVICE_ORDER"] = "PCI_BUS_ID"
+        os.environ["CUDA_VISIBLE_DEVICES"] = "3"
+        print(os.environ["CUDA_VISIBLE_DEVICES"])
+    else:
+        iteration = int(sys.argv[1])
     train_until(iteration)
 

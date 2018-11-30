@@ -1,7 +1,10 @@
+import logging
 from gunpowder import CsvPointsSource, Point
 import numpy as np
 import h5py
 import pdb
+
+logger = logging.getLogger(__name__)
 
 class SwcPoint(Point):
 
@@ -17,7 +20,7 @@ class SwcPoint(Point):
 
 class SwcSource(CsvPointsSource):
     '''Read points of a skeleton from a hdf dataset.
-    --> todo: should also be possible to read from swc file directly with considering offset.
+    --> todo: should also be possible to read from swc file directly with considering offset and resolution
 
     Each line in the file represents one point as::
 
@@ -65,8 +68,8 @@ class SwcSource(CsvPointsSource):
         return {
             int(p[self.ndims]): SwcPoint(
                 p[:self.ndims],
-                p[self.ndims],
-                p[self.ndims + 1] if p[self.ndims + 1] >= 0 else None,
+                int(p[self.ndims]),
+                int(p[self.ndims + 1]),
             )
             for p in filtered
         }
@@ -82,7 +85,26 @@ class SwcSource(CsvPointsSource):
 
             # data = [x, y, z, point_id, parent_id]
             self.data = np.transpose(np.array([points[:, 2], points[:, 3], points[:, 4], points[:, 0], points[:, 6]]))
-            print('points set: ', self.data.shape)
+
+            resolution = None
+            if data_file[self.dataset].attrs.__contains__('resolution'):
+                resolution = data_file[self.dataset].attrs.get('resolution')
 
             if self.scale is not None:
-                self.data[:, self.ndims] *= self.scale
+                self.data[:, :self.ndims] *= self.scale
+                if resolution is not None:
+                    if resolution != self.scale:
+                        logger.warning("WARNING: File %s contains resolution information "
+                                       "for %s (dataset %s). However, voxel size has been set to scale factor %s." 
+                                       "This might not be what you want.",
+                                       self.filename, points, self.dataset, self.scale)
+            elif resolution is not None:
+                self.data[:, :self.ndims] *= resolution
+            else:
+                logger.warning("WARNING: No scaling factor or resolution information in file %s"
+                               "for %s (dataset %s). So points refer to voxel positions, "
+                               "this might not be what you want.",
+                               self.filename, points, self.dataset)
+
+
+
